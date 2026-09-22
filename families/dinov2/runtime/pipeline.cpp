@@ -37,8 +37,9 @@ std::vector<uint8_t> rgb_bytes(const internal::ImageView& image) {
     for (std::size_t index = 0; index < count; ++index) {
         if (!std::isfinite(data[index]))
             throw std::invalid_argument("DINOv2 float32 RGB image contains a non-finite value");
-        bytes[index] =
-            static_cast<uint8_t>(std::lround(std::clamp(data[index], 0.0F, 1.0F) * 255.0F));
+        // Exactly std::lround for this nonnegative range: the double sum is exact.
+        const float scaled = std::clamp(data[index], 0.0F, 1.0F) * 255.0F;
+        bytes[index] = static_cast<uint8_t>(static_cast<double>(scaled) + 0.5);
     }
     return bytes;
 }
