@@ -5,6 +5,9 @@
 
 #include "families/dinov2/runtime/image_preprocess.h"
 
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
@@ -75,6 +78,122 @@ void test_identity_resize_preserves_pixels() {
             "identity resize must keep 8-bit values and NCHW order");
 }
 
+// Straightforward reference: Pillow's two-pass resize of the whole image (64-bit sums),
+// then the Transformers center crop, rescale and normalize.
+// Pillow's Resample.c bicubic_filter with a = -0.5, in its evaluation order.
+double reference_cubic(double value) {
+    value = std::abs(value);
+    if (value < 1.0)
+        return ((-0.5 + 2.0) * value - (-0.5 + 3.0)) * value * value + 1.0;
+    if (value < 2.0)
+        return (((value - 5.0) * value + 8.0) * value - 4.0) * -0.5;
+    return 0.0;
+}
+
+std::vector<uint8_t> reference_resize(const std::vector<uint8_t>& input, int32_t in_h, int32_t in_w,
+                                      int32_t out_h, int32_t out_w) {
+    auto pass = [](const std::vector<uint8_t>& source, int32_t rows, int32_t in_size,
+                   int32_t out_size, bool horizontal, int32_t other) {
+        const double scale = static_cast<double>(in_size) / out_size;
+        const double filter_scale = std::max(scale, 1.0);
+        const double support = 2.0 * filter_scale;
+        std::vector<uint8_t> result(static_cast<std::size_t>(rows) * out_size * 3U);
+        for (int32_t o = 0; o < out_size; ++o) {
+            const double center = (o + 0.5) * scale;
+            const int32_t first = std::max(0, static_cast<int32_t>(center - support + 0.5));
+            const int32_t end = std::min(in_size, static_cast<int32_t>(center + support + 0.5));
+            std::vector<double> weights;
+            double total = 0.0;
+            for (int32_t i = first; i < end; ++i) {
+                weights.push_back(reference_cubic((i - center + 0.5) * (1.0 / filter_scale)));
+                total += weights.back();
+            }
+            std::vector<int64_t> fixed;
+            for (double w : weights) {
+                const double scaled = w / total * 4194304.0;
+                fixed.push_back(static_cast<int64_t>(scaled < 0 ? scaled - 0.5 : scaled + 0.5));
+            }
+            for (int32_t r = 0; r < rows; ++r) {
+                for (int32_t c = 0; c < 3; ++c) {
+                    int64_t sum = 2097152;
+                    for (int32_t i = first; i < end; ++i) {
+                        const std::size_t at =
+                            horizontal ? (static_cast<std::size_t>(r) * in_size + i) * 3U + c
+                                       : (static_cast<std::size_t>(i) * other + r) * 3U + c;
+                        sum += source[at] * fixed[static_cast<std::size_t>(i - first)];
+                    }
+                    const uint8_t value =
+                        sum <= 0 ? 0 : static_cast<uint8_t>(std::min<int64_t>(sum >> 22, 255));
+                    const std::size_t at =
+                        horizontal ? (static_cast<std::size_t>(r) * out_size + o) * 3U + c
+                                   : (static_cast<std::size_t>(o) * other + r) * 3U + c;
+                    result[at] = value;
+                }
+            }
+        }
+        return result;
+    };
+    auto horizontal = in_w == out_w ? input : pass(input, in_h, in_w, out_w, true, 0);
+    return in_h == out_h ? horizontal : pass(horizontal, out_w, in_h, out_h, false, out_w);
+}
+
+std::vector<float> reference_preprocess(const std::vector<uint8_t>& image, int32_t h, int32_t w,
+                                        const trtmc::Dinov2PreprocessConfig& config) {
+    const auto geometry = trtmc::compute_dinov2_image_geometry(h, w, config);
+    const auto resized = reference_resize(image, h, w, geometry.resized_h, geometry.resized_w);
+    const auto plane = static_cast<std::size_t>(config.input_image_h) * config.input_image_w;
+    std::vector<float> result(3U * plane);
+    for (int32_t y = 0; y < config.input_image_h; ++y) {
+        for (int32_t x = 0; x < config.input_image_w; ++x) {
+            const auto source =
+                (static_cast<std::size_t>(geometry.crop_y + y) * geometry.resized_w +
+                 static_cast<std::size_t>(geometry.crop_x + x)) *
+                3U;
+            for (std::size_t c = 0; c < 3; ++c) {
+                const float value = static_cast<float>(resized[source + c]) / 255.0F;
+                result[c * plane + static_cast<std::size_t>(y) * config.input_image_w + x] =
+                    (value - config.image_mean[c]) / config.image_std[c];
+            }
+        }
+    }
+    return result;
+}
+
+void test_crop_window_matches_full_resize_then_crop() {
+    struct Case {
+        int32_t height, width;
+        trtmc::Dinov2PreprocessConfig config;
+    };
+    const trtmc::Dinov2PreprocessConfig checkpoint{};
+    const trtmc::Dinov2PreprocessConfig small{14, 28, 32, {0.5F, 0.25F, 0.75F}, {0.2F, 0.4F, 0.8F}};
+    const std::vector<Case> cases{
+        {382, 640, checkpoint},   // the E2E photograph: both passes downscale
+        {640, 382, checkpoint},   // portrait
+        {1500, 2000, checkpoint}, // large downscale
+        {256, 256, checkpoint},   // no resize at all
+        {256, 300, checkpoint},   // horizontal pass only
+        {300, 256, checkpoint},   // vertical pass only
+        {257, 256, checkpoint},   // odd crop margin
+        {150, 100, checkpoint},   // upscale in both directions
+        {7, 10, small},           // tiny upscale with a narrow non-square crop
+        {45, 33, small},
+    };
+    uint32_t state = 12345;
+    for (const auto& item : cases) {
+        std::vector<uint8_t> image(static_cast<std::size_t>(item.height) * item.width * 3U);
+        for (auto& value : image) {
+            state = state * 1664525U + 1013904223U;
+            value = static_cast<uint8_t>(state >> 24);
+        }
+        const auto actual =
+            trtmc::preprocess_dinov2_image(image.data(), item.height, item.width, item.config);
+        const auto expected = reference_preprocess(image, item.height, item.width, item.config);
+        if (actual != expected)
+            throw std::runtime_error("crop-window resampling must be bit-identical to "
+                                     "resizing the whole image and cropping it");
+    }
+}
+
 void test_invalid_configuration() {
     const std::vector<uint8_t> image(12, 0);
     rejects([&] { trtmc::compute_dinov2_image_geometry(0, 2, checkpoint_config()); },
@@ -96,6 +215,7 @@ int main() {
         test_transformers_resize_and_crop_geometry();
         test_constant_image_normalization();
         test_identity_resize_preserves_pixels();
+        test_crop_window_matches_full_resize_then_crop();
         test_invalid_configuration();
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << "\n";
